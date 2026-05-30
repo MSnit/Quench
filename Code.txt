@@ -1,0 +1,703 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <Keypad.h>
+#include <ESP32Servo.h>
+#include "qrcodegen.h"
+
+// Define TFT Display Pins
+#define TFT_CS    15
+#define TFT_RST    4
+#define TFT_DC     2
+
+// Create TFT display object
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+// Define 4x4 Keypad
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1', '2', '3', 'A'},
+  {'4', '5', '6', 'B'},
+  {'7', '8', '9', 'C'},
+  {'*', '0', '#', 'D'}
+};
+byte rowPins[ROWS] = {13, 12, 14, 27};
+byte colPins[COLS] = {26, 25, 19, 21};
+
+// Create Keypad object
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// HC-SR04 Ultrasonic Sensor Pins
+#define TRIG_PIN 22
+#define ECHO_PIN 16
+
+// Servo Motor Pin
+#define SERVO_PIN 5
+Servo tapServo;
+
+// Flow rate calculation - 100ml per second flow rate
+const float ML_PER_SECOND = 10.0; // 100ml flows in 1 second
+
+// QR Code Buffers
+uint8_t qrcodeData[qrcodegen_BUFFER_LEN_MAX];
+uint8_t tempBuffer[qrcodegen_BUFFER_LEN_MAX];
+
+// Store User Inputs
+String inputML = "";
+String inputMoney = "";
+bool showingQR = false;
+bool paymentVerified = false;
+bool cupDetected = false;
+int countdownTimer = 0;
+unsigned long lastTimerUpdate = 0;
+bool dispensingComplete = false;
+unsigned long dispensingStartTime = 0;
+
+// Screen state
+enum ScreenState {
+  WELCOME_SCREEN,
+  ML_INPUT_SCREEN,
+  CALCULATE_AMOUNT_SCREEN,
+  QR_CODE_SCREEN,
+  PAYMENT_VERIFIED_SCREEN,
+  CUP_DETECTION_SCREEN,
+  DISPENSING_SCREEN,
+  THANK_YOU_SCREEN
+};
+
+ScreenState currentScreen = WELCOME_SCREEN;
+
+// Conversion rate: 1000ml = 20 Rs (new rate)
+const float ML_TO_RS_RATE = 0.02; // 20 Rs / 1000 ml = 0.02 Rs per ml
+const int MAX_DISPENSING_ML = 1500; // Maximum 1.5L limit
+
+// Cup detection parameters
+const float CUP_DETECTION_DISTANCE = 10.0; // cm - if object detected within this distance, cup is present
+const int CUP_DETECTION_TIMEOUT = 15000; // ms - timeout for cup detection (15 seconds)
+unsigned long cupDetectionStartTime = 0;
+
+// Function to measure distance using HC-SR04
+float measureDistance() {
+  // Clear the trigger pin
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  
+  // Set trigger pin HIGH for 10 microseconds
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  // Read the echo pin, returns the sound wave travel time in microseconds
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  
+  // Calculate distance in centimeters
+  // Speed of sound is 343 m/s = 0.0343 cm/µs
+  // Time is round trip so we divide by 2
+  float distance = duration * 0.0343 / 2;
+  
+  return distance;
+}
+
+// Function to detect cup presence
+bool detectCup() {
+  float distance = measureDistance();
+  Serial.print("Distance: ");
+  Serial.print(distance);
+  Serial.println(" cm");
+  
+  return (distance < CUP_DETECTION_DISTANCE && distance > 0);
+}
+
+// Function to control tap servo
+void controlTap(bool openTap) {
+  if (openTap) {
+    // Open tap (position depends on servo orientation)
+    tapServo.write(90); // Adjust value as needed for your setup
+  } else {
+    // Close tap
+    tapServo.write(0); // Adjust value as needed for your setup
+  }
+}
+
+// Function to Generate QR Code
+void generateQRCode(String data) {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(40, 40);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.println("Generating QR...");
+  Serial.println("Generating QR Code for: " + data);
+  bool success = qrcodegen_encodeText(
+    data.c_str(), tempBuffer, qrcodeData,
+    qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+    qrcodegen_Mask_AUTO, true
+  );
+  if (!success) {
+    Serial.println("QR Code Generation Failed!");
+    tft.setCursor(50, 80);
+    tft.setTextColor(ILI9341_RED);
+    tft.println("QR Failed!");
+    return;
+  }
+  Serial.println("QR Code Successfully Generated!");
+  // Display QR Code
+  int qrSize = qrcodegen_getSize(qrcodeData);
+  int scale = 5;
+  int xOffset = (tft.width() - (qrSize * scale)) / 2;
+  int yOffset = 50;
+  tft.fillScreen(ILI9341_BLACK);
+  
+  // Show what's being purchased
+  tft.setCursor(10, 10);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("ML: ");
+  tft.println(inputML);
+  tft.setCursor(10, 30);
+  tft.print("Rs: ");
+  tft.println(inputMoney);
+  
+  for (int y = 0; y < qrSize; y++) {
+    for (int x = 0; x < qrSize; x++) {
+      if (qrcodegen_getModule(qrcodeData, x, y)) {
+        tft.fillRect(xOffset + x * scale, yOffset + y * scale, scale, scale, ILI9341_WHITE);
+      }
+    }
+  }
+  
+  tft.setCursor(10, 220);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.println("Press D to verify payment");
+  
+  showingQR = true;
+  currentScreen = QR_CODE_SCREEN;
+}
+
+void showWelcomeScreen() {
+  tft.fillScreen(ILI9341_BLACK);
+  
+  // Center-aligned WELCOME text only
+  int welcomeWidth = 126; // Approximate width of "WELCOME" text with font size 3
+  tft.setCursor((tft.width() - welcomeWidth) / 2, 40);
+  tft.setTextSize(3);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.println("WELCOME");
+  
+  // Left-aligned options (not centered)
+  tft.setCursor(30, 100);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.println("A = Request ML");
+  
+  tft.setCursor(30, 130);
+  tft.println("B = Calculate Amount");
+  
+  // Left-aligned info text
+  tft.setCursor(30, 190);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.println("Max limit: 1500 ML (1.5L)");
+  
+  tft.setCursor(30, 210);
+  tft.println("Rate: Rs 20 per 1000 ML");
+  
+  currentScreen = WELCOME_SCREEN;
+  dispensingComplete = false;
+}
+
+void showMLInputScreen() {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(20, 30);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_CYAN);
+  
+  tft.println("REQUEST ML AMOUNT");
+  
+  tft.setCursor(20, 70);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.println("Enter ML: " + inputML);
+  
+  if (inputML.length() > 0) {
+    int ml = inputML.toInt();
+    if (ml > MAX_DISPENSING_ML) {
+      tft.setCursor(20, 100);
+      tft.setTextColor(ILI9341_RED);
+      tft.println("Exceeds 1.5L limit!");
+      tft.setTextColor(ILI9341_WHITE);
+    }
+  }
+  
+  tft.setCursor(20, 140);
+  tft.setTextSize(1);
+  tft.println("* = Clear, # = Backspace");
+  tft.setCursor(20, 160);
+  tft.println("A = Back to Welcome");
+  tft.setCursor(20, 180);
+  tft.println("C = Generate QR");
+  
+  currentScreen = ML_INPUT_SCREEN;
+}
+
+void showCalculateAmountScreen() {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(20, 30);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_CYAN);
+  
+  tft.println("CALCULATE AMOUNT");
+  
+  tft.setCursor(20, 70);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.println("Enter ML: " + inputML);
+  
+  // Calculate and show price if ML is entered
+  if (inputML.length() > 0) {
+    calculatePrice();
+    tft.setCursor(20, 110);
+    tft.println("Price: Rs " + inputMoney);
+    
+    int ml = inputML.toInt();
+    if (ml > MAX_DISPENSING_ML) {
+      tft.setCursor(20, 140);
+      tft.setTextColor(ILI9341_RED);
+      tft.println("Exceeds 1.5L limit!");
+      tft.setTextColor(ILI9341_WHITE);
+    }
+  }
+  
+  tft.setCursor(20, 180);
+  tft.setTextSize(1);
+  tft.println("* = Clear, # = Backspace");
+  tft.setCursor(20, 200);
+  tft.println("A = Back to Welcome");
+  tft.setCursor(20, 220);
+  tft.println("C = Generate QR");
+  
+  currentScreen = CALCULATE_AMOUNT_SCREEN;
+}
+
+void calculatePrice() {
+  if (inputML.length() > 0) {
+    float ml = inputML.toFloat();
+    float price = ml * ML_TO_RS_RATE;
+    // Round to 2 decimal places
+    price = round(price * 100) / 100.0;
+    inputMoney = String(price);
+  } else {
+    inputMoney = "";
+  }
+}
+
+void showPaymentVerified() {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(40, 80);
+  tft.setTextSize(3);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.println("PAYMENT");
+  tft.setCursor(40, 120);
+  tft.println("VERIFIED");
+  
+  tft.setCursor(20, 180);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.println("Looking for cup...");
+  
+  delay(2000); // Show verification message for 2 seconds
+  
+  currentScreen = PAYMENT_VERIFIED_SCREEN;
+  startCupDetection();
+}
+
+void startCupDetection() {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(20, 30);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.println("PLACE YOUR CUP");
+  
+  tft.setCursor(40, 80);
+  tft.setTextSize(2);
+  tft.println("Waiting for cup");
+  tft.setCursor(40, 120);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.println("detection...");
+  
+  tft.setCursor(20, 200);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.println("Press any key to cancel");
+  
+  currentScreen = CUP_DETECTION_SCREEN;
+  cupDetectionStartTime = millis();
+}
+
+void startDispensingWater() {
+  // Convert ML to dispensing time in milliseconds
+  int requestedML = inputML.toInt();
+  float dispensingTimeSeconds = requestedML / ML_PER_SECOND;
+  int dispensingTimeMS = int(dispensingTimeSeconds * 1000);
+  
+  dispensingStartTime = millis();
+  countdownTimer = dispensingTimeSeconds;
+  
+  // Open the tap
+  controlTap(true);
+  
+  lastTimerUpdate = millis();
+  currentScreen = DISPENSING_SCREEN;
+  updateDispensingScreen();
+}
+
+void updateDispensingScreen() {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(20, 30);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.println("DISPENSING WATER");
+  
+  tft.setCursor(20, 70);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("ML: ");
+  tft.println(inputML);
+  
+  // Calculate timer-based values
+  int requestedML = inputML.toInt();
+  unsigned long currentTime = millis();
+  int elapsedSeconds = (currentTime - lastTimerUpdate) / 1000;
+  int remainingSeconds = countdownTimer - elapsedSeconds;
+  if (remainingSeconds < 0) remainingSeconds = 0;
+  
+  // Calculate dispensed ML based on timer progress
+  int dispensedML = map(elapsedSeconds, 0, countdownTimer, 0, requestedML);
+  if (dispensedML > requestedML) dispensedML = requestedML;
+  
+  // Calculate remaining ML for this dispensing operation
+  int remainingML = requestedML - dispensedML;
+  
+  // Calculate water left in machine
+  int waterLeftInMachine = MAX_DISPENSING_ML - requestedML;
+  
+  // Draw progress bar
+  int barWidth = 220;
+  int barHeight = 30;
+  int progress = map(elapsedSeconds, 0, countdownTimer, 0, barWidth);
+  if (progress > barWidth) progress = barWidth;
+  
+  tft.drawRect(30, 120, barWidth, barHeight, ILI9341_WHITE);
+  tft.fillRect(30, 120, progress, barHeight, ILI9341_BLUE);
+  
+  tft.setCursor(100, 170);
+  tft.setTextSize(3);
+  tft.println(String(remainingSeconds) + "s");
+  
+  tft.setCursor(20, 210);
+  tft.setTextSize(1);
+  tft.println("Remaining ML to dispense: " + String(remainingML));
+
+  // Show how much water is left in the machine
+  tft.setCursor(20, 225);
+  tft.println("Machine Balance: " + String(waterLeftInMachine) + " ML");
+  
+  // Check if dispensing has finished (time elapsed)
+  unsigned long elapsedDispensingTime = millis() - dispensingStartTime;
+  float dispensingTimeSeconds = requestedML / ML_PER_SECOND;
+  int dispensingTimeMS = int(dispensingTimeSeconds * 1000);
+  
+  if (elapsedDispensingTime >= dispensingTimeMS && !dispensingComplete) {
+    // Close the tap
+    controlTap(false);
+    dispensingComplete = true;
+    delay(500); // Brief pause before switching to thank you screen
+    showThankYouScreen(waterLeftInMachine);
+  }
+}
+
+void showThankYouScreen(int waterLeftInMachine) {
+  tft.fillScreen(ILI9341_BLACK);
+  
+  // Display thank you message
+  int thankYouWidth = 150; // Approximate width of "THANK YOU" text with font size 3
+  tft.setCursor((tft.width() - thankYouWidth) / 2, 80);
+  tft.setTextSize(3);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.println("THANK YOU");
+  
+  // Display dispensed amount
+  tft.setCursor(40, 130);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.print("Dispensed: ");
+  tft.println(inputML + " ML");
+  
+  // Display remaining water in machine
+  tft.setCursor(40, 160);
+  tft.print("Machine Balance: ");
+  tft.println(String(waterLeftInMachine) + " ML");
+  
+  tft.setCursor(40, 200);
+  tft.setTextSize(1);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.println("Press any key to continue");
+  
+  currentScreen = THANK_YOU_SCREEN;
+  
+  // Stay on thank you screen for 3 seconds, then reset
+  delay(3000);
+  // Do NOT automatically reset here - let the user press a key or wait for timeout in loop()
+}
+
+void resetSystem() {
+  inputML = "";
+  inputMoney = "";
+  showingQR = false;
+  paymentVerified = false;
+  cupDetected = false;
+  countdownTimer = 0;
+  // Ensure tap is closed
+  controlTap(false);
+  showWelcomeScreen();
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize TFT display
+  tft.begin();
+  tft.setRotation(3);
+  
+  // Initialize ultrasonic sensor pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  // Initialize servo
+  ESP32PWM::allocateTimer(0);
+  tapServo.setPeriodHertz(50);      // Standard 50hz servo
+  tapServo.attach(SERVO_PIN, 500, 2400); // attaches the servo to the pin
+  
+  // Ensure tap is closed at startup
+  controlTap(false);
+  
+  // Show welcome screen
+  showWelcomeScreen();
+}
+
+void loop() {
+  char key = keypad.getKey();
+  
+  // Handle cup detection
+  if (currentScreen == CUP_DETECTION_SCREEN) {
+    // Check for cup every 500ms
+    static unsigned long lastCupCheckTime = 0;
+    if (millis() - lastCupCheckTime > 500) {
+      lastCupCheckTime = millis();
+      
+      // Check for cup presence
+      if (detectCup()) {
+        cupDetected = true;
+        tft.fillScreen(ILI9341_BLACK);
+        tft.setCursor(40, 80);
+        tft.setTextSize(2);
+        tft.setTextColor(ILI9341_GREEN);
+        tft.println("CUP DETECTED!");
+        tft.setCursor(40, 120);
+        tft.println("Starting dispensing...");
+        delay(1500);
+        startDispensingWater();
+      }
+      
+      // Check for timeout
+      if (millis() - cupDetectionStartTime > CUP_DETECTION_TIMEOUT) {
+        tft.fillScreen(ILI9341_BLACK);
+        tft.setCursor(40, 80);
+        tft.setTextSize(2);
+        tft.setTextColor(ILI9341_RED);
+        tft.println("CUP DETECTION");
+        tft.setCursor(40, 110);
+        tft.println("TIMEOUT");
+        tft.setCursor(40, 160);
+        tft.setTextSize(1);
+        tft.setTextColor(ILI9341_WHITE);
+        tft.println("Returning to welcome screen...");
+        delay(3000);
+        resetSystem();
+      }
+    }
+  }
+  
+  // Handle countdown timer for dispensing
+  if (currentScreen == DISPENSING_SCREEN && !dispensingComplete) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastTimerUpdate >= 1000) { // Update every second
+      lastTimerUpdate = currentTime;
+      updateDispensingScreen();
+    }
+  }
+  
+  // Auto-timeout for thank you screen after 5 seconds (extra time beyond the 3 seconds in the function)
+  if (currentScreen == THANK_YOU_SCREEN) {
+    static unsigned long thankYouStartTime = 0;
+    if (thankYouStartTime == 0) {
+      thankYouStartTime = millis();
+    }
+    
+    if (millis() - thankYouStartTime > 8000) { // 8 seconds total (3s delay + 5s here)
+      thankYouStartTime = 0;
+      resetSystem();
+    }
+  }
+  
+  if (key) {
+    Serial.print("Key Pressed: ");
+    Serial.println(key);
+    
+    // Handle key presses based on current screen
+    switch (currentScreen) {
+      case WELCOME_SCREEN:
+        if (key == 'A') {
+          // Switch to ML input screen
+          showMLInputScreen();
+        } 
+        else if (key == 'B') {
+          // Switch to Calculate Amount screen
+          showCalculateAmountScreen();
+        }
+        break;
+        
+      case ML_INPUT_SCREEN:
+        if (key == 'A') {
+          // Go back to welcome screen
+          showWelcomeScreen();
+        } 
+        else if (key == 'C') {
+          // Generate QR if ML is entered
+          if (inputML.length() > 0) {
+            int ml = inputML.toInt();
+            if (ml > MAX_DISPENSING_ML) {
+              // Show error for exceeding limit
+              tft.setCursor(20, 100);
+              tft.setTextColor(ILI9341_RED);
+              tft.println("Exceeds 1.5L limit!");
+              delay(2000);
+              showMLInputScreen();
+            } else {
+              calculatePrice();
+              generateQRCode("upi://pay?pa=8007557800@paytm&am=" + inputMoney + "&tn=ML:" + inputML);
+            }
+          } else {
+            // Flash a warning if ML is empty
+            tft.setCursor(20, 120);
+            tft.setTextColor(ILI9341_RED);
+            tft.println("Enter ML amount first!");
+            delay(2000);
+            showMLInputScreen();
+          }
+        }
+        else if (key == '*') {
+          // Clear current input
+          inputML = "";
+          inputMoney = "";
+          showMLInputScreen();
+        } 
+        else if (key == '#') {
+          // Backspace functionality
+          if (inputML.length() > 0) {
+            inputML.remove(inputML.length() - 1);
+          }
+          showMLInputScreen();
+        }
+        else if (key >= '0' && key <= '9') {
+          // Add digit to ML input
+          inputML += key;
+          int ml = inputML.toInt();
+          // Prevent entering more than 9999 ml
+          if (ml > 9999) {
+            inputML = "9999";
+          }
+          showMLInputScreen();
+        }
+        break;
+        
+      case CALCULATE_AMOUNT_SCREEN:
+        if (key == 'A') {
+          // Go back to welcome screen
+          showWelcomeScreen();
+        } 
+        else if (key == 'C') {
+          // Generate QR if ML is entered
+          if (inputML.length() > 0) {
+            int ml = inputML.toInt();
+            if (ml > MAX_DISPENSING_ML) {
+              // Show error for exceeding limit
+              tft.setCursor(20, 140);
+              tft.setTextColor(ILI9341_RED);
+              tft.println("Exceeds 1.5L limit!");
+              delay(2000);
+              showCalculateAmountScreen();
+            } else {
+              calculatePrice();
+              generateQRCode("upi://pay?pa=8007557800@paytm&am=" + inputMoney + "&tn=ML:" + inputML);
+            }
+          } else {
+            // Flash a warning if ML is empty
+            tft.setCursor(20, 140);
+            tft.setTextColor(ILI9341_RED);
+            tft.println("Enter ML amount first!");
+            delay(2000);
+            showCalculateAmountScreen();
+          }
+        }
+        else if (key == '*') {
+          // Clear current input
+          inputML = "";
+          inputMoney = "";
+          showCalculateAmountScreen();
+        } 
+        else if (key == '#') {
+          // Backspace functionality
+          if (inputML.length() > 0) {
+            inputML.remove(inputML.length() - 1);
+            calculatePrice();
+          }
+          showCalculateAmountScreen();
+        }
+        else if (key >= '0' && key <= '9') {
+          // Add digit to ML input
+          inputML += key;
+          int ml = inputML.toInt();
+          // Prevent entering more than 9999 ml
+          if (ml > 9999) {
+            inputML = "9999";
+          }
+          calculatePrice();
+          showCalculateAmountScreen();
+        }
+        break;
+        
+      case QR_CODE_SCREEN:
+        if (key == 'D') {
+          // Verify payment
+          paymentVerified = true;
+          showPaymentVerified();
+        }
+        else if (key == 'A') {
+          // Go back to welcome screen
+          showWelcomeScreen();
+        }
+        break;
+        
+      case CUP_DETECTION_SCREEN:
+        // Any key during cup detection cancels and returns to welcome screen
+        resetSystem();
+        break;
+        
+      case PAYMENT_VERIFIED_SCREEN:
+      case DISPENSING_SCREEN:
+      case THANK_YOU_SCREEN:
+        // Any key during verification, dispensing, or thank you will return to welcome screen
+        resetSystem();
+        break;
+    }
+  }
+}
